@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Http.Features;
 using TestProject.Models;
 using TestProject.Services;
 
@@ -13,9 +14,14 @@ namespace TestProject
 
             // Add services to the container.
 
-            builder.Services.Configure<FileBrowserOptions>(
-                builder.Configuration.GetSection(FileBrowserOptions.SectionName));
+            var section = builder.Configuration.GetSection(FileBrowserOptions.SectionName);
+            builder.Services.Configure<FileBrowserOptions>(section);
             builder.Services.AddSingleton<IFileService, FileService>();
+
+            // One setting caps uploads at both layers: Kestrel's request body and multipart form parsing.
+            var maxUploadBytes = (section.Get<FileBrowserOptions>() ?? new FileBrowserOptions()).MaxUploadBytes;
+            builder.WebHost.ConfigureKestrel(kestrel => kestrel.Limits.MaxRequestBodySize = maxUploadBytes);
+            builder.Services.Configure<FormOptions>(form => form.MultipartBodyLengthLimit = maxUploadBytes);
 
             builder.Services
                 .AddControllers(options => options.Filters.Add<FileServiceExceptionFilter>())
