@@ -56,25 +56,6 @@ namespace TestProject.Controllers
         [HttpPost("download")]
         public IActionResult DownloadByForm([FromForm(Name = "path")] string[]? paths) => Download(paths);
 
-        /// <summary>
-        /// POST /api/files/delete with { "paths": [...] }. The three operations below are POSTs rather than
-        /// DELETE/PUT because they take a list of paths, and a request body on DELETE is dropped by some proxies.
-        /// The response says, item by item, what happened.
-        /// </summary>
-        [HttpPost("delete")]
-        public OperationResult Delete(PathsRequest request) =>
-            _files.Delete(request.Paths ?? Array.Empty<string>());
-
-        /// <summary>POST /api/files/move with { "paths": [...], "destination": "/Projects" }.</summary>
-        [HttpPost("move")]
-        public OperationResult Move(TransferRequest request) =>
-            _files.Move(request.Paths ?? Array.Empty<string>(), request.Destination);
-
-        /// <summary>POST /api/files/copy with { "paths": [...], "destination": "/Projects" }.</summary>
-        [HttpPost("copy")]
-        public OperationResult Copy(TransferRequest request) =>
-            _files.Copy(request.Paths ?? Array.Empty<string>(), request.Destination);
-
         private IActionResult Download(string[]? paths)
         {
             var download = _files.OpenDownload(paths ?? Array.Empty<string>());

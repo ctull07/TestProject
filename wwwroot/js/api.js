@@ -35,22 +35,6 @@ export function listFiles({ path, q, sort, dir }, signal) {
     return request(`/api/files?${params}`, { signal });
 }
 
-function postJson(url, body) {
-    return request(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-    });
-}
-
-/**
- * Delete, move and copy each return { succeeded, skipped, failed: [{ path, error }] }.
- * A request-level problem (such as an invalid destination) rejects with an ApiError instead.
- */
-export const deleteItems = paths => postJson('/api/files/delete', { paths });
-export const moveItems = (paths, destination) => postJson('/api/files/move', { paths, destination });
-export const copyItems = (paths, destination) => postJson('/api/files/copy', { paths, destination });
-
 /**
  * POST /api/files/upload. One request per file. XMLHttpRequest is used instead of fetch because
  * fetch cannot report upload progress. `onProgress` receives the number of bytes sent so far.
