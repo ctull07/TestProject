@@ -1,6 +1,7 @@
-import { listFiles, startDownload, ApiError } from './api.js';
+import { listFiles, startDownload, deleteItems, moveItems, copyItems, ApiError } from './api.js';
 import { toUrl, fromLocation } from './router.js';
 import { UploadQueue } from './UploadQueue.js';
+import { confirmDelete, pickFolder } from './dialogs.js';
 import { formatBytes, formatDate, count, parentPath, escapeHtml } from './format.js';
 
 const ROW_HEIGHT = 32;          // fixed, so the visible window can be computed from scrollTop alone
@@ -26,6 +27,7 @@ export class FileBrowser {
     #abort = null;                // cancels the request that is still in flight
     #selection = new Set();       // paths of selected entries
     #viewKey = '';                // folder + search text; the selection is cleared when it changes
+    #busy = false;                // true while a delete, move or copy request is running
     #uploads;
     #uploadFrame = 0;
     #searchTimer = 0;
@@ -124,7 +126,15 @@ export class FileBrowser {
             const action = event.target.closest('button[data-action]')?.dataset.action;
             if (action === 'upload') this.#el.fileInput.click();
             else if (action === 'download') this.#downloadSelection();
+            else if (action === 'copy') this.#transferSelection('copy');
+            else if (action === 'move') this.#transferSelection('move');
+            else if (action === 'delete') this.#deleteSelection();
             else if (action === 'dismiss-uploads') this.#dismissUploads();
+        });
+
+        // The Delete key asks to delete the selection, unless the user is typing in the search box.
+        this.#root.addEventListener('keydown', event => {
+            if (event.key === 'Delete' && event.target !== this.#el.search) this.#deleteSelection();
         });
 
         this.#el.head.addEventListener('click', event => {
@@ -216,6 +226,67 @@ export class FileBrowser {
         startDownload([...this.#selection], message => this.#notify(message, true));
     }
 
+    #selectedEntries() {
+        return (this.#listing?.entries ?? []).filter(entry => this.#selection.has(entry.path));
+    }
+
+    async #deleteSelection() {
+        const entries = this.#selectedEntries();
+        if (entries.length === 0 || this.#busy) return;
+        if (!await confirmDelete(entries)) return;
+        await this.#perform(
+            () => deleteItems(entries.map(e => e.path)),
+            result => `Deleted ${count(result.succeeded, 'item', 'items')}.`);
+    }
+
+    /** Move and copy are the same flow with a different verb and request. */
+    async #transferSelection(kind) {
+        const entries = this.#selectedEntries();
+        if (entries.length === 0 || this.#busy) return;
+        const move = kind === 'move';
+
+        const destination = await pickFolder({
+            title: `${move ? 'Move' : 'Copy'} ${count(entries.length, 'item', 'items')} to`,
+            confirmLabel: move ? 'Move' : 'Copy',
+            startPath: this.#state.path,
+            blockedPaths: entries.filter(e => e.type === 'folder').map(e => e.path),
+            // Outside a search every item is already in the current folder, so moving here would do nothing.
+            unavailablePath: move && !this.#state.q ? this.#state.path : null
+        });
+        if (destination === null) return;
+
+        const send = move ? moveItems : copyItems;
+        await this.#perform(
+            () => send(entries.map(e => e.path), destination),
+            result => `${move ? 'Moved' : 'Copied'} ${count(result.succeeded, 'item', 'items')} to ${destination}.`);
+    }
+
+    /**
+     * Runs one delete, move or copy request, tells the user what happened, and refreshes the list.
+     * The server reports each item separately, so a partly successful batch is shown as both.
+     */
+    async #perform(request, successMessage) {
+        this.#busy = true;
+        this.#root.setAttribute('aria-busy', 'true');
+        this.#renderToolbar();
+        try {
+            const result = await request();
+            const parts = [];
+            if (result.succeeded) parts.push(successMessage(result));
+            if (result.skipped) parts.push(`${count(result.skipped, 'item was', 'items were')} already in that folder.`);
+            if (!result.succeeded && !result.skipped && !result.failed.length) parts.push('Nothing to do.');
+            for (const failure of result.failed.slice(0, 3)) parts.push(`${failure.path}: ${failure.error}.`);
+            if (result.failed.length > 3) parts.push(`And ${result.failed.length - 3} more failed.`);
+            this.#notify(parts.join(' '), result.failed.length > 0, result.failed.length ? 12000 : 6000);
+        } catch (err) {
+            this.#notify(err.message, true);
+        }
+        this.#selection.clear();
+        this.#busy = false;
+        this.#root.removeAttribute('aria-busy');
+        await this.#load({ keepScroll: true });
+    }
+
     #queueUploads(files) {
         if (files.length === 0 || this.#error) return;
         clearTimeout(this.#lingerTimer);
@@ -235,13 +306,13 @@ export class FileBrowser {
         this.#uploads.clearFinished();
     }
 
-    #notify(message, isError = false) {
+    #notify(message, isError = false, duration = 6000) {
         const notice = this.#el.notice;
         notice.textContent = message;
         notice.classList.toggle('error', isError);
         notice.hidden = false;
         clearTimeout(this.#noticeTimer);
-        this.#noticeTimer = setTimeout(() => { notice.hidden = true; }, 6000);
+        this.#noticeTimer = setTimeout(() => { notice.hidden = true; }, duration);
     }
 
     // ---- rendering --------------------------------------------------------------------------------------
@@ -256,6 +327,9 @@ export class FileBrowser {
                     <div class="actions">
                         <button type="button" class="btn" data-action="upload">Upload</button>
                         <button type="button" class="btn" data-action="download" disabled>Download</button>
+                        <button type="button" class="btn" data-action="copy" disabled>Copy to...</button>
+                        <button type="button" class="btn" data-action="move" disabled>Move to...</button>
+                        <button type="button" class="btn danger" data-action="delete" disabled>Delete</button>
                         <input type="file" class="file-input" multiple hidden>
                     </div>
                 </div>
@@ -278,7 +352,8 @@ export class FileBrowser {
             crumbs: q('.crumbs'), search: q('.search'), summary: q('.summary'), notice: q('.notice'),
             uploads: q('.uploads'), viewport: q('.viewport'), head: q('.head'), spacer: q('.spacer'),
             rows: q('.rows'), message: q('.message'), selectAll: q('.select-all'),
-            fileInput: q('.file-input'), uploadButton: q('[data-action=upload]'), downloadButton: q('[data-action=download]')
+            fileInput: q('.file-input'), uploadButton: q('[data-action=upload]'), downloadButton: q('[data-action=download]'),
+            needsSelection: [...this.#root.querySelectorAll('[data-action=copy], [data-action=move], [data-action=delete]')]
         };
     }
 
@@ -353,8 +428,9 @@ export class FileBrowser {
     #renderToolbar() {
         const total = this.#listing?.entries.length ?? 0;
         const selected = this.#selection.size;
-        this.#el.uploadButton.disabled = !this.#listing;
+        this.#el.uploadButton.disabled = !this.#listing || this.#busy;
         this.#el.downloadButton.disabled = selected === 0;
+        for (const button of this.#el.needsSelection) button.disabled = selected === 0 || this.#busy;
         this.#el.downloadButton.textContent = selected ? `Download (${selected.toLocaleString()})` : 'Download';
         this.#el.selectAll.checked = total > 0 && selected === total;
         this.#el.selectAll.indeterminate = selected > 0 && selected < total;
