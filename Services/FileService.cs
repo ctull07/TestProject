@@ -8,7 +8,7 @@ namespace TestProject.Services {
     public class FileService : IFileService {
         private const int SearchLimit = 10_000;
         private const string OutsideRootMessage = "Path escapes the configured home directory";
-        private const int MaxDownloadItems = 500;
+        private const int MaxBatchItems = 500;
         private const int MaxNameAttempts = 1000;
         private const int BufferSize = 81920;
 
