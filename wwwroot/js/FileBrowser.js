@@ -1,10 +1,13 @@
-import { listFiles, ApiError } from './api.js';
+import { listFiles, startDownload, ApiError } from './api.js';
 import { toUrl, fromLocation } from './router.js';
+import { UploadQueue } from './UploadQueue.js';
 import { formatBytes, formatDate, count, parentPath, escapeHtml } from './format.js';
 
 const ROW_HEIGHT = 32;          // fixed, so the visible window can be computed from scrollTop alone
 const OVERSCAN = 8;             // extra rows rendered above and below the viewport to hide scroll flicker
 const SEARCH_DEBOUNCE_MS = 200;
+const UPLOAD_LIST_LIMIT = 6;    // rows shown in the upload panel; the rest are summarized
+const SUCCESS_LINGER_MS = 4000;
 
 /**
  * The whole browser as one component. It renders into `root`, owns the UI state, and talks to the server
@@ -12,21 +15,32 @@ const SEARCH_DEBOUNCE_MS = 200;
  * for example inside a dialog.
  *
  * State is { path, q, sort, dir }. It is the same object that router.js reads from and writes to the URL.
+ * Selection and uploads are working state, so they are deliberately not part of the URL.
  */
 export class FileBrowser {
     #root;
     #router;
     #state;
-    #listing = null;      // last successful response
-    #error = null;        // last failed response, or null
-    #abort = null;        // cancels the request that is still in flight
+    #listing = null;              // last successful response
+    #error = null;                // last failed response, or null
+    #abort = null;                // cancels the request that is still in flight
+    #selection = new Set();       // paths of selected entries
+    #viewKey = '';                // folder + search text; the selection is cleared when it changes
+    #uploads;
+    #uploadFrame = 0;
     #searchTimer = 0;
     #scrollFrame = 0;
+    #noticeTimer = 0;
+    #lingerTimer = 0;
     #el = {};
 
     constructor(root, router) {
         this.#root = root;
         this.#router = router;
+        this.#uploads = new UploadQueue({
+            onChange: () => this.#scheduleUploadRender(),
+            onSettled: folders => this.#uploadsSettled(folders)
+        });
     }
 
     start() {
@@ -57,21 +71,41 @@ export class FileBrowser {
         this.#load();
     }
 
-    async #load() {
+    async #load({ keepScroll = false } = {}) {
         this.#abort?.abort();                    // a newer request always wins over an older one
         const request = (this.#abort = new AbortController());
         this.#root.setAttribute('aria-busy', 'true');
+
+        const viewKey = this.#state.path + '\n' + this.#state.q;
+        if (viewKey !== this.#viewKey) {
+            this.#viewKey = viewKey;
+            if (this.#selection.size) {
+                this.#selection.clear();
+                this.#renderSelection();         // do not leave Download enabled for the old folder while the new one loads
+            }
+        }
+
         try {
             this.#listing = await listFiles(this.#state, request.signal);
             this.#error = null;
+            this.#dropMissingFromSelection();
         } catch (err) {
             if (err.name === 'AbortError') return;
             this.#listing = null;
             this.#error = err instanceof ApiError ? err : new ApiError(0, 'Could not reach the server');
+            this.#selection.clear();
         }
         this.#root.removeAttribute('aria-busy');
-        this.#el.viewport.scrollTop = 0;
+        if (!keepScroll) this.#el.viewport.scrollTop = 0;
         this.#render();
+    }
+
+    #dropMissingFromSelection() {
+        if (this.#selection.size === 0) return;
+        const present = new Set(this.#listing.entries.map(e => e.path));
+        for (const path of this.#selection) {
+            if (!present.has(path)) this.#selection.delete(path);
+        }
     }
 
     // ---- events -----------------------------------------------------------------------------------------
@@ -81,9 +115,16 @@ export class FileBrowser {
         // A plain left click is handled in place; anything else is left to the browser.
         this.#root.addEventListener('click', event => {
             const link = event.target.closest('a[data-nav]');
-            if (!link || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-            event.preventDefault();
-            this.#navigate(fromLocation(new URL(link.href)));
+            if (link) {
+                if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                event.preventDefault();
+                this.#navigate(fromLocation(new URL(link.href)));
+                return;
+            }
+            const action = event.target.closest('button[data-action]')?.dataset.action;
+            if (action === 'upload') this.#el.fileInput.click();
+            else if (action === 'download') this.#downloadSelection();
+            else if (action === 'dismiss-uploads') this.#dismissUploads();
         });
 
         this.#el.head.addEventListener('click', event => {
@@ -105,7 +146,44 @@ export class FileBrowser {
             }
         });
 
-        this.#el.viewport.addEventListener('scroll', () => {
+        // Selection
+        this.#el.rows.addEventListener('change', event => {
+            const box = event.target.closest('input[data-select]');
+            if (!box) return;
+            box.checked ? this.#selection.add(box.dataset.path) : this.#selection.delete(box.dataset.path);
+            this.#renderSelection();
+        });
+        this.#el.selectAll.addEventListener('change', () => {
+            this.#selection.clear();
+            if (this.#el.selectAll.checked) {
+                for (const entry of this.#listing?.entries ?? []) this.#selection.add(entry.path);
+            }
+            this.#renderSelection();
+        });
+
+        // Upload: from the button, or by dropping files on the list
+        this.#el.fileInput.addEventListener('change', () => {
+            this.#queueUploads([...this.#el.fileInput.files]);
+            this.#el.fileInput.value = '';       // lets the same file be chosen again
+        });
+        const viewport = this.#el.viewport;
+        viewport.addEventListener('dragover', event => {
+            if (![...event.dataTransfer.types].includes('Files')) return;
+            event.preventDefault();
+            viewport.classList.add('dragging');
+        });
+        viewport.addEventListener('dragleave', event => {
+            if (!viewport.contains(event.relatedTarget)) viewport.classList.remove('dragging');
+        });
+        viewport.addEventListener('drop', event => {
+            event.preventDefault();
+            viewport.classList.remove('dragging');
+            const { files, skippedFolders } = droppedFiles(event.dataTransfer);   // must be read inside the event
+            if (skippedFolders) this.#notify('Folders cannot be uploaded. Only the files you dropped were sent.', true);
+            this.#queueUploads(files);
+        });
+
+        viewport.addEventListener('scroll', () => {
             if (this.#scrollFrame) return;       // at most one repaint per animation frame
             this.#scrollFrame = requestAnimationFrame(() => {
                 this.#scrollFrame = 0;
@@ -113,7 +191,7 @@ export class FileBrowser {
             });
         }, { passive: true });
 
-        new ResizeObserver(() => this.#renderRows()).observe(this.#el.viewport);
+        new ResizeObserver(() => this.#renderRows()).observe(viewport);
     }
 
     #sortBy(field) {
@@ -131,6 +209,41 @@ export class FileBrowser {
         }
     }
 
+    // ---- transfers --------------------------------------------------------------------------------------
+
+    #downloadSelection() {
+        if (this.#selection.size === 0) return;
+        startDownload([...this.#selection], message => this.#notify(message, true));
+    }
+
+    #queueUploads(files) {
+        if (files.length === 0 || this.#error) return;
+        clearTimeout(this.#lingerTimer);
+        this.#uploads.add(files, this.#state.path);
+    }
+
+    /** The queue emptied. Refresh the list if any file landed in the folder being viewed. */
+    #uploadsSettled(folders) {
+        if (folders.has(this.#state.path)) this.#load({ keepScroll: true });
+        if (this.#uploads.stats.failed === 0) {
+            this.#lingerTimer = setTimeout(() => this.#dismissUploads(), SUCCESS_LINGER_MS);
+        }
+    }
+
+    #dismissUploads() {
+        clearTimeout(this.#lingerTimer);
+        this.#uploads.clearFinished();
+    }
+
+    #notify(message, isError = false) {
+        const notice = this.#el.notice;
+        notice.textContent = message;
+        notice.classList.toggle('error', isError);
+        notice.hidden = false;
+        clearTimeout(this.#noticeTimer);
+        this.#noticeTimer = setTimeout(() => { notice.hidden = true; }, 6000);
+    }
+
     // ---- rendering --------------------------------------------------------------------------------------
 
     #buildShell() {
@@ -140,10 +253,18 @@ export class FileBrowser {
                     <nav class="crumbs" aria-label="Breadcrumb"></nav>
                     <input class="search" type="search" autocomplete="off" aria-label="Search files and folders"
                            placeholder="Search this folder and everything below">
+                    <div class="actions">
+                        <button type="button" class="btn" data-action="upload">Upload</button>
+                        <button type="button" class="btn" data-action="download" disabled>Download</button>
+                        <input type="file" class="file-input" multiple hidden>
+                    </div>
                 </div>
                 <div class="summary" role="status" aria-live="polite"></div>
+                <div class="notice" role="alert" hidden></div>
+                <div class="uploads" hidden></div>
                 <div class="viewport">
                     <div class="head">
+                        <label class="check"><input type="checkbox" class="select-all" aria-label="Select all"></label>
                         <button type="button" data-sort="name">Name<span class="arrow"></span></button>
                         <button type="button" data-sort="size" class="num">Size<span class="arrow"></span></button>
                         <button type="button" data-sort="modified" class="when">Modified<span class="arrow"></span></button>
@@ -154,19 +275,27 @@ export class FileBrowser {
             </div>`;
         const q = selector => this.#root.querySelector(selector);
         this.#el = {
-            crumbs: q('.crumbs'), search: q('.search'), summary: q('.summary'), viewport: q('.viewport'),
-            head: q('.head'), spacer: q('.spacer'), rows: q('.rows'), message: q('.message')
+            crumbs: q('.crumbs'), search: q('.search'), summary: q('.summary'), notice: q('.notice'),
+            uploads: q('.uploads'), viewport: q('.viewport'), head: q('.head'), spacer: q('.spacer'),
+            rows: q('.rows'), message: q('.message'), selectAll: q('.select-all'),
+            fileInput: q('.file-input'), uploadButton: q('[data-action=upload]'), downloadButton: q('[data-action=download]')
         };
     }
 
     #render() {
         this.#renderCrumbs();
         this.#renderSortArrows();
-        this.#renderSummary();
+        this.#renderSelection();
         this.#renderMessage();
-        this.#renderRows();
         const folder = this.#state.path.split('/').filter(Boolean).pop();
         document.title = (folder ? folder + ' - ' : '') + 'File Browser';
+    }
+
+    /** Everything that depends on the selection. Cheap enough to run on every checkbox click. */
+    #renderSelection() {
+        this.#renderSummary();
+        this.#renderToolbar();
+        this.#renderRows();
     }
 
     #linkTo(patch) {
@@ -194,7 +323,7 @@ export class FileBrowser {
         }
     }
 
-    /** The counts-and-sizes line required for the current view. */
+    /** The counts-and-sizes line for the current view, plus the selection when there is one. */
     #renderSummary() {
         const summary = this.#el.summary;
         if (!this.#listing) {
@@ -211,7 +340,25 @@ export class FileBrowser {
         parts.push(count(totals.files, 'file', 'files'));
         parts.push(`${formatBytes(totals.bytes)} in files`);
         if (truncated) parts.push('showing the first results only, so narrow the search');
+        if (this.#selection.size) {
+            let bytes = 0;
+            for (const entry of entries) {
+                if (this.#selection.has(entry.path)) bytes += entry.size ?? 0;
+            }
+            parts.push(`<b class="selected-info">${this.#selection.size.toLocaleString()} selected (${formatBytes(bytes)} in files)</b>`);
+        }
         summary.innerHTML = parts.map(p => `<span>${p}</span>`).join('');
+    }
+
+    #renderToolbar() {
+        const total = this.#listing?.entries.length ?? 0;
+        const selected = this.#selection.size;
+        this.#el.uploadButton.disabled = !this.#listing;
+        this.#el.downloadButton.disabled = selected === 0;
+        this.#el.downloadButton.textContent = selected ? `Download (${selected.toLocaleString()})` : 'Download';
+        this.#el.selectAll.checked = total > 0 && selected === total;
+        this.#el.selectAll.indeterminate = selected > 0 && selected < total;
+        this.#el.selectAll.disabled = total === 0;
     }
 
     #renderMessage() {
@@ -224,7 +371,7 @@ export class FileBrowser {
             html = this.#state.q
                 ? `<strong>No matches for “${escapeHtml(this.#state.q)}”</strong>
                    <span>Searched ${escapeHtml(this.#listing.path)} and everything below it.</span>`
-                : '<strong>This folder is empty</strong>';
+                : '<strong>This folder is empty</strong><span>Upload files, or drop them here.</span>';
         }
         message.hidden = !html;
         message.innerHTML = html;
@@ -254,15 +401,83 @@ export class FileBrowser {
 
     #rowHtml(entry, searching) {
         const isFolder = entry.type === 'folder';
+        const selected = this.#selection.has(entry.path);
         const name = isFolder
             ? `<a data-nav class="name folder" href="${this.#linkTo({ path: entry.path })}">${escapeHtml(entry.name)}</a>`
             : `<span class="name">${escapeHtml(entry.name)}</span>`;
         // In search results the same name can appear in many folders, so show where each one lives.
         const where = searching ? `<span class="where">${escapeHtml(parentPath(entry.path))}</span>` : '';
-        return `<div class="row">
+        return `<div class="row${selected ? ' selected' : ''}">
+                    <label class="check"><input type="checkbox" data-select data-path="${escapeHtml(entry.path)}"
+                        aria-label="Select ${escapeHtml(entry.name)}"${selected ? ' checked' : ''}></label>
                     <div class="cell-name">${name}${where}</div>
                     <div class="num">${isFolder ? '' : formatBytes(entry.size)}</div>
                     <div class="when">${formatDate(entry.modified)}</div>
                 </div>`;
     }
+
+    // ---- upload panel -----------------------------------------------------------------------------------
+
+    /** Progress events arrive far faster than a screen refreshes, so repaint at most once per frame. */
+    #scheduleUploadRender() {
+        if (this.#uploadFrame) return;
+        this.#uploadFrame = requestAnimationFrame(() => {
+            this.#uploadFrame = 0;
+            this.#renderUploads();
+        });
+    }
+
+    #renderUploads() {
+        const panel = this.#el.uploads;
+        const stats = this.#uploads.stats;
+        if (stats.total === 0) {
+            panel.hidden = true;
+            return;
+        }
+        const busy = stats.active > 0;
+        const title = busy
+            ? `Uploading ${count(stats.total, 'file', 'files')} (${stats.finished} done)`
+            : stats.failed
+                ? `Uploaded ${stats.done} of ${count(stats.total, 'file', 'files')}, ${stats.failed} failed`
+                : `Uploaded ${count(stats.done, 'file', 'files')}`;
+
+        // Show only what needs attention: files in flight, failures, and files that had to be renamed.
+        const notable = this.#uploads.items.filter(item =>
+            item.status === 'uploading' || item.status === 'error' || (item.status === 'done' && item.savedAs !== item.file.name));
+        const lines = notable.slice(0, UPLOAD_LIST_LIMIT).map(item => {
+            const note = item.status === 'uploading' ? `${Math.floor((item.loaded / Math.max(item.file.size, 1)) * 100)}%`
+                : item.status === 'error' ? escapeHtml(item.error)
+                : `saved as ${escapeHtml(item.savedAs)}`;
+            return `<li class="${item.status}"><span class="u-name">${escapeHtml(item.file.name)}</span><span class="u-note">${note}</span></li>`;
+        });
+        if (notable.length > UPLOAD_LIST_LIMIT) lines.push(`<li class="more">and ${notable.length - UPLOAD_LIST_LIMIT} more</li>`);
+
+        panel.hidden = false;
+        panel.innerHTML = `
+            <div class="uploads-head">
+                <strong>${title}</strong>
+                <progress max="${Math.max(stats.bytesTotal, 1)}" value="${stats.bytesLoaded}"></progress>
+                ${busy ? '' : '<button type="button" class="btn small" data-action="dismiss-uploads">Dismiss</button>'}
+            </div>
+            ${lines.length ? `<ul>${lines.join('')}</ul>` : ''}`;
+    }
+}
+
+/**
+ * Splits a drop into files and folders. Browsers hand a dropped folder over as a bogus zero-size "file",
+ * so each item is asked what it really is. DataTransfer is only readable during the drop event itself.
+ */
+function droppedFiles(dataTransfer) {
+    const files = [];
+    let skippedFolders = 0;
+    for (const item of dataTransfer.items) {
+        if (item.kind !== 'file') continue;
+        if (item.webkitGetAsEntry?.()?.isDirectory) {
+            skippedFolders++;
+            continue;
+        }
+        const file = item.getAsFile();
+        if (file) files.push(file);
+    }
+    return { files, skippedFolders };
 }
