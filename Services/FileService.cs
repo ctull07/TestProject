@@ -10,7 +10,7 @@ namespace TestProject.Services
     {
         private const int SearchLimit = 10_000;
         private const string OutsideRootMessage = "Path escapes the configured home directory";
-        private const int MaxDownloadItems = 500;
+        private const int MaxBatchItems = 500;
         private const int MaxNameAttempts = 1000;
         private const int BufferSize = 81920;
 
@@ -35,6 +35,15 @@ namespace TestProject.Services
             RecurseSubdirectories = true,
             IgnoreInaccessible = true,
             AttributesToSkip = Skipped
+        };
+
+        // A copy must not silently drop anything, so unlike listing it includes hidden files, and an unreadable
+        // folder is an error instead of being skipped. Links are still never followed.
+        private static readonly EnumerationOptions CopyEnumeration = new()
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = false,
+            AttributesToSkip = FileAttributes.ReparsePoint
         };
 
         // Windows and macOS file systems are case-insensitive by default; Linux is not.
@@ -159,17 +168,7 @@ namespace TestProject.Services
 
         public DownloadFile OpenDownload(IReadOnlyList<string> paths)
         {
-            if (paths.Count == 0)
-            {
-                throw new FileServiceException(400, "Nothing to download");
-            }
-            if (paths.Count > MaxDownloadItems)
-            {
-                throw new FileServiceException(400, "Too many items. Download at most " + MaxDownloadItems + " at a time");
-            }
-
-            var targets = WithoutNested(
-                paths.Select(ResolveExisting).Distinct(StringComparer.FromComparison(PathComparison)).ToList());
+            var targets = ResolveTargets(paths, "Nothing to download");
 
             if (targets.Count == 1 && File.Exists(targets[0]))
             {
@@ -182,6 +181,24 @@ namespace TestProject.Services
 
             var zipName = (targets.Count == 1 ? DisplayName(targets[0]) : "download") + ".zip";
             return new DownloadFile(BuildArchive(targets), zipName, "application/zip");
+        }
+
+        /// <summary>
+        /// Turns the client's list of virtual paths into real ones for download, delete, move and copy.
+        /// Every path is resolved (and so safety-checked) and must exist before anything is touched.
+        /// </summary>
+        private List<string> ResolveTargets(IReadOnlyList<string> paths, string emptyMessage)
+        {
+            if (paths.Count == 0)
+            {
+                throw new FileServiceException(400, emptyMessage);
+            }
+            if (paths.Count > MaxBatchItems)
+            {
+                throw new FileServiceException(400, "Too many items. Choose at most " + MaxBatchItems + " at a time");
+            }
+            return WithoutNested(
+                paths.Select(ResolveExisting).Distinct(StringComparer.FromComparison(PathComparison)).ToList());
         }
 
         private string ResolveExisting(string? virtualPath)
@@ -271,6 +288,206 @@ namespace TestProject.Services
 
         private static string ContentTypeFor(string fileName) =>
             ContentTypes.TryGetContentType(fileName, out var type) ? type : "application/octet-stream";
+
+        // ---- delete, move, copy ------------------------------------------------------------------------------
+        //
+        // Whole-request problems (a bad destination, moving a folder into itself) are checked first and throw
+        // before anything changes. After that each item runs on its own, so one locked file is reported
+        // without stopping the rest.
+
+        public OperationResult Delete(IReadOnlyList<string> paths)
+        {
+            var targets = ResolveTargets(paths, "Nothing selected");
+            RejectHomeDirectory(targets, "deleted");
+
+            return RunBatch(targets, target => {
+                if (File.Exists(target))
+                {
+                    File.Delete(target);
+                }
+                else
+                {
+                    Directory.Delete(target, recursive: true);   // a symlink inside is removed, never what it points to
+                }
+                return true;
+            });
+        }
+
+        public OperationResult Move(IReadOnlyList<string> paths, string? destination)
+        {
+            var targets = ResolveTargets(paths, "Nothing selected");
+            RejectHomeDirectory(targets, "moved");
+            var folder = ResolveDirectory(destination);
+            RejectIntoItself(targets, folder, "move");
+
+            return RunBatch(targets, source => {
+                if (string.Equals(Path.GetDirectoryName(source), folder, PathComparison))
+                {
+                    return false;   // already in the destination, nothing to do
+                }
+
+                var target = Path.Combine(folder, Path.GetFileName(source));
+                FileServiceException Clash() => new(
+                    409, "\"" + Path.GetFileName(source) + "\" already exists in " + ToVirtualPath(folder));
+
+                if (File.Exists(target) || Directory.Exists(target))
+                {
+                    throw Clash();   // a move never overwrites
+                }
+
+                try
+                {
+                    if (Directory.Exists(source))
+                    {
+                        Directory.Move(source, target);
+                    }
+                    else
+                    {
+                        File.Move(source, target);
+                    }
+                }
+                catch (IOException) when (File.Exists(target) || Directory.Exists(target))
+                {
+                    throw Clash();   // something took the name between the check and the move
+                }
+                return true;
+            });
+        }
+
+        public OperationResult Copy(IReadOnlyList<string> paths, string? destination)
+        {
+            var targets = ResolveTargets(paths, "Nothing selected");
+            RejectHomeDirectory(targets, "copied");
+            var folder = ResolveDirectory(destination);
+            RejectIntoItself(targets, folder, "copy");
+
+            return RunBatch(targets, source => {
+                CopyInto(source, folder);
+                return true;
+            });
+        }
+
+        /// <summary>Runs the action for each target. It returns true when it did something, false when it skipped.</summary>
+        private OperationResult RunBatch(IReadOnlyList<string> targets, Func<string, bool> action)
+        {
+            int succeeded = 0, skipped = 0;
+            var failed = new List<ItemFailure>();
+
+            foreach (var target in targets)
+            {
+                try
+                {
+                    if (action(target)) succeeded++; else skipped++;
+                }
+                catch (FileServiceException ex)
+                {
+                    failed.Add(new ItemFailure(ToVirtualPath(target), ex.Message));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // The framework's message contains the server's real path, so report a fixed one.
+                    failed.Add(new ItemFailure(ToVirtualPath(target),
+                        ex is UnauthorizedAccessException ? "Access denied" : "The item is in use or could not be changed"));
+                }
+            }
+            return new OperationResult(succeeded, skipped, failed);
+        }
+
+        private void RejectHomeDirectory(IEnumerable<string> targets, string verb)
+        {
+            if (targets.Any(t => t.Equals(_root, PathComparison)))
+            {
+                throw new FileServiceException(400, "The home directory cannot be " + verb);
+            }
+        }
+
+        /// <summary>Copying or moving a folder into itself, or into a folder below it, would never finish.</summary>
+        private static void RejectIntoItself(IEnumerable<string> sources, string destination, string verb)
+        {
+            foreach (var source in sources.Where(Directory.Exists))
+            {
+                if (destination.Equals(source, PathComparison) ||
+                    destination.StartsWith(source + Path.DirectorySeparatorChar, PathComparison))
+                {
+                    throw new FileServiceException(400, "Cannot " + verb + " \"" + Path.GetFileName(source) + "\" into itself");
+                }
+            }
+        }
+
+        private static void CopyInto(string source, string folder)
+        {
+            if (File.Exists(source))
+            {
+                CopyFile(source, folder);
+                return;
+            }
+
+            var copy = CreateUniqueFolder(folder, Path.GetFileName(source));
+            try
+            {
+                CopyContents(source, copy);
+            }
+            catch
+            {
+                Directory.Delete(copy, recursive: true);   // never leave a half-copied folder behind
+                throw;
+            }
+        }
+
+        /// <summary>Copies into the folder under a free name. File.Copy refuses to overwrite, so a clash cannot lose data.</summary>
+        private static void CopyFile(string source, string folder)
+        {
+            var name = Path.GetFileName(source);
+            for (var attempt = 0; attempt <= MaxNameAttempts; attempt++)
+            {
+                var target = Path.Combine(folder, attempt == 0 ? name : WithSuffix(name, attempt));
+                if (Directory.Exists(target))
+                {
+                    continue;
+                }
+                try
+                {
+                    File.Copy(source, target, overwrite: false);
+                    return;
+                }
+                catch (IOException) when (File.Exists(target))
+                {
+                    // Taken. Try the next name.
+                }
+            }
+            throw new FileServiceException(409, "Could not find a free name for \"" + name + "\"");
+        }
+
+        private static string CreateUniqueFolder(string parent, string name)
+        {
+            for (var attempt = 0; attempt <= MaxNameAttempts; attempt++)
+            {
+                var target = Path.Combine(parent, attempt == 0 ? name : WithSuffix(name, attempt));
+                if (!File.Exists(target) && !Directory.Exists(target))
+                {
+                    Directory.CreateDirectory(target);
+                    return target;
+                }
+            }
+            throw new FileServiceException(409, "Could not find a free name for \"" + name + "\"");
+        }
+
+        private static void CopyContents(string source, string destination)
+        {
+            foreach (var info in new DirectoryInfo(source).EnumerateFileSystemInfos("*", CopyEnumeration))
+            {
+                var target = Path.Combine(destination, Path.GetRelativePath(source, info.FullName));
+                if (info is DirectoryInfo)
+                {
+                    Directory.CreateDirectory(target);
+                }
+                else
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                    File.Copy(info.FullName, target);
+                }
+            }
+        }
 
         // ---- path safety -------------------------------------------------------------------------------------
 
