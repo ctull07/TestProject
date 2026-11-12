@@ -1,4 +1,5 @@
-namespace TestProject.Models {
+namespace TestProject.Models
+{
     /// <summary>Response for POST /api/files/upload. Name can differ from the uploaded name if it was already taken.</summary>
     public record UploadResult(string Name, string Path, long Size);
 

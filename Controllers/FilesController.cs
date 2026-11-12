@@ -2,14 +2,17 @@ using Microsoft.AspNetCore.Mvc;
 using TestProject.Models;
 using TestProject.Services;
 
-namespace TestProject.Controllers {
+namespace TestProject.Controllers
+{
     [ApiController]
     [Route("api/files")]
-    public class FilesController : ControllerBase {
+    public class FilesController : ControllerBase
+    {
 
         private readonly IFileService _files;
 
-        public FilesController(IFileService files) {
+        public FilesController(IFileService files)
+        {
             _files = files;
         }
 
@@ -22,7 +25,8 @@ namespace TestProject.Controllers {
             [FromQuery] string? path,
             [FromQuery] string? q,
             [FromQuery] SortField sort = SortField.Name,
-            [FromQuery] SortDirection dir = SortDirection.Asc) {
+            [FromQuery] SortDirection dir = SortDirection.Asc)
+        {
             return _files.List(path, q, sort, dir);
         }
 
@@ -31,7 +35,8 @@ namespace TestProject.Controllers {
         /// The client sends one request per file, which gives it per-file progress and per-file errors.
         /// </summary>
         [HttpPost("upload")]
-        public async Task<IActionResult> Upload([FromQuery] string? path, IFormFile file, CancellationToken cancellationToken) {
+        public async Task<IActionResult> Upload([FromQuery] string? path, IFormFile file, CancellationToken cancellationToken)
+        {
             await using var content = file.OpenReadStream();
             var result = await _files.SaveUploadAsync(path, file.FileName, content, cancellationToken);
             return StatusCode(StatusCodes.Status201Created, result);
@@ -70,7 +75,8 @@ namespace TestProject.Controllers {
         public OperationResult Copy(TransferRequest request) =>
             _files.Copy(request.Paths ?? Array.Empty<string>(), request.Destination);
 
-        private IActionResult Download(string[]? paths) {
+        private IActionResult Download(string[]? paths)
+        {
             var download = _files.OpenDownload(paths ?? Array.Empty<string>());
             // The result disposes the stream when the response ends, which also deletes a temporary ZIP.
             return File(download.Content, download.ContentType, download.FileName, enableRangeProcessing: true);
