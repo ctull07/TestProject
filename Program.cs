@@ -34,6 +34,11 @@ namespace TestProject
 
             app.MapControllers();
 
+            // Deep links such as /browse/Documents are client-side routes. Serve the app for them,
+            // on this prefix only, so a mistyped /api/... URL still returns a real 404.
+            app.MapFallbackToFile("/browse", "index.html");
+            app.MapFallbackToFile("/browse/{*path}", "index.html");
+
             app.Run();
         }
     }
