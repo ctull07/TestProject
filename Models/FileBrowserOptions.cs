@@ -11,5 +11,8 @@
         /// Override per machine with the FileBrowser__RootPath environment variable.
         /// </summary>
         public string RootPath { get; set; } = "SampleFiles";
+
+        /// <summary>Largest single upload in bytes. Applied to both Kestrel and multipart form parsing.</summary>
+        public long MaxUploadBytes { get; set; } = 1024L * 1024 * 1024;
     }
 }
