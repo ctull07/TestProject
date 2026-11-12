@@ -1,18 +1,15 @@
-﻿using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc;
 using TestProject.Models;
 using TestProject.Services;
 
-namespace TestProject.Controllers
-{
+namespace TestProject.Controllers {
     [ApiController]
     [Route("api/files")]
-    public class FilesController : ControllerBase
-    {
+    public class FilesController : ControllerBase {
 
         private readonly IFileService _files;
 
-        public FilesController(IFileService files)
-        {
+        public FilesController(IFileService files) {
             _files = files;
         }
 
@@ -25,8 +22,7 @@ namespace TestProject.Controllers
             [FromQuery] string? path,
             [FromQuery] string? q,
             [FromQuery] SortField sort = SortField.Name,
-            [FromQuery] SortDirection dir = SortDirection.Asc)
-        {
+            [FromQuery] SortDirection dir = SortDirection.Asc) {
             return _files.List(path, q, sort, dir);
         }
 
@@ -35,8 +31,7 @@ namespace TestProject.Controllers
         /// The client sends one request per file, which gives it per-file progress and per-file errors.
         /// </summary>
         [HttpPost("upload")]
-        public async Task<IActionResult> Upload([FromQuery] string? path, IFormFile file, CancellationToken cancellationToken)
-        {
+        public async Task<IActionResult> Upload([FromQuery] string? path, IFormFile file, CancellationToken cancellationToken) {
             await using var content = file.OpenReadStream();
             var result = await _files.SaveUploadAsync(path, file.FileName, content, cancellationToken);
             return StatusCode(StatusCodes.Status201Created, result);
@@ -56,8 +51,26 @@ namespace TestProject.Controllers
         [HttpPost("download")]
         public IActionResult DownloadByForm([FromForm(Name = "path")] string[]? paths) => Download(paths);
 
-        private IActionResult Download(string[]? paths)
-        {
+        /// <summary>
+        /// POST /api/files/delete with { "paths": [...] }. The three operations below are POSTs rather than
+        /// DELETE/PUT because they take a list of paths, and a request body on DELETE is dropped by some proxies.
+        /// The response says, item by item, what happened.
+        /// </summary>
+        [HttpPost("delete")]
+        public OperationResult Delete(PathsRequest request) =>
+            _files.Delete(request.Paths ?? Array.Empty<string>());
+
+        /// <summary>POST /api/files/move with { "paths": [...], "destination": "/Projects" }.</summary>
+        [HttpPost("move")]
+        public OperationResult Move(TransferRequest request) =>
+            _files.Move(request.Paths ?? Array.Empty<string>(), request.Destination);
+
+        /// <summary>POST /api/files/copy with { "paths": [...], "destination": "/Projects" }.</summary>
+        [HttpPost("copy")]
+        public OperationResult Copy(TransferRequest request) =>
+            _files.Copy(request.Paths ?? Array.Empty<string>(), request.Destination);
+
+        private IActionResult Download(string[]? paths) {
             var download = _files.OpenDownload(paths ?? Array.Empty<string>());
             // The result disposes the stream when the response ends, which also deletes a temporary ZIP.
             return File(download.Content, download.ContentType, download.FileName, enableRangeProcessing: true);
