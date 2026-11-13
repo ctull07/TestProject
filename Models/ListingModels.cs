@@ -1,4 +1,4 @@
-namespace TestProject.Models
+﻿namespace TestProject.Models
 {
     public enum EntryType { Folder, File }
 
@@ -11,9 +11,6 @@ namespace TestProject.Models
 
     /// <summary>Counts and total file bytes for everything in the current view.</summary>
     public record ListingTotals(int Folders, int Files, long Bytes);
-
-    /// <summary>Response for GET /api/files/size: everything beneath one folder, at any depth.</summary>
-    public record FolderSize(string Path, long Bytes, int Files, int Folders);
 
     /// <summary>Response for GET /api/files: a folder listing, or search results beneath that folder.</summary>
     public record DirectoryListing(

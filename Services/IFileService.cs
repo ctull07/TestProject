@@ -9,12 +9,6 @@ namespace TestProject.Services {
         DirectoryListing List(string? path, string? query, SortField sort, SortDirection dir);
 
         /// <summary>
-        /// Total size and counts of everything beneath a folder. The walk can be long on a big tree, so it
-        /// stops when the token is cancelled, and a recent answer is reused until something changes.
-        /// </summary>
-        FolderSize GetFolderSize(string? path, CancellationToken cancellationToken);
-
-        /// <summary>
         /// Stores an uploaded file in a folder. A name that is already taken gets a suffix, "a (1).txt",
         /// so an upload never overwrites anything.
         /// </summary>

@@ -35,14 +35,6 @@ export function listFiles({ path, q, sort, dir }, signal) {
     return request(`/api/files?${params}`, { signal });
 }
 
-/**
- * GET /api/files/size. Resolves to { path, bytes, files, folders } for everything beneath one folder.
- * Kept apart from listing because measuring a big tree is slow and must never delay the list.
- */
-export function folderSize(path, signal) {
-    return request(`/api/files/size?${new URLSearchParams({ path })}`, { signal });
-}
-
 function postJson(url, body) {
     return request(url, {
         method: 'POST',

@@ -112,9 +112,8 @@ three transfers at a time. A failed or cancelled upload deletes its partial file
 failure part way is a clean error instead of a corrupt download. The cost is that the first byte waits for
 the whole archive. Streaming the ZIP directly is the next step if that matters.
 
-**Folder sizes load after the list, one request per folder, so a large tree never delays browsing.** They count 
-the same files the list shows (hidden and system files excluded) and are cached for 60 seconds. Sorting by 
-size orders files only; folders stay first, sorted by name.
+**Folder sizes are not computed.** Summing a folder's contents on every listing is slow on large trees. The
+view shows counts, per-file sizes and the total size of the files shown. See below.
 
 **The UI state is the URL.** `toUrl` and `fromLocation` are exact inverses. Folders and breadcrumbs are real
 links, so open-in-new-tab and copy-link work. Search and sort replace the history entry so Back does not step
