@@ -1,5 +1,4 @@
 using Microsoft.AspNetCore.StaticFiles;
-using System.Collections.Concurrent;
 using Microsoft.Extensions.Options;
 using System.IO.Compression;
 using System.Text.RegularExpressions;
@@ -53,14 +52,6 @@ namespace TestProject.Services
                 ? StringComparison.OrdinalIgnoreCase
                 : StringComparison.Ordinal;
 
-        // Folder sizes are the slow part of browsing, so a result is reused for a short time. Static, because the
-        // service itself may be created per request. Every change made through this service empties the cache.
-        private const int SizeCacheMilliseconds = 60_000;
-        private const int SizeCacheLimit = 5_000;
-        private static readonly ConcurrentDictionary<string, (FolderSize Size, long ExpiresAt)> SizeCache =
-            new(StringComparer.FromComparison(PathComparison));
-        private static long _sizeEpoch;   // bumped on every change, so a count that raced with one is not cached
-
         // Absolute path of the home directory, without a trailing separator.
         private readonly string _root;
 
@@ -107,67 +98,6 @@ namespace TestProject.Services
                 truncated, entries);
         }
 
-        // ---- folder size -------------------------------------------------------------------------------------
-
-        public FolderSize GetFolderSize(string? path, CancellationToken cancellationToken)
-        {
-            var fullPath = ResolveDirectory(path);
-            var now = Environment.TickCount64;
-            if (SizeCache.TryGetValue(fullPath, out var hit) && hit.ExpiresAt > now)
-            {
-                return hit.Size;
-            }
-
-            var epoch = Interlocked.Read(ref _sizeEpoch);
-            long bytes = 0;
-            int files = 0, folders = 0;
-            try
-            {
-                // Same options as listing and ZIP, so the number matches what the page shows and what a download holds.
-                foreach (var info in new DirectoryInfo(fullPath).EnumerateFileSystemInfos("*", Recursive))
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    if (info is FileInfo file)
-                    {
-                        try
-                        {
-                            bytes += file.Length;
-                            files++;
-                        }
-                        catch (IOException)
-                        {
-                            // Removed while we were counting.
-                        }
-                    }
-                    else
-                    {
-                        folders++;
-                    }
-                }
-            }
-            catch (DirectoryNotFoundException)
-            {
-                throw new FileServiceException(404, "Not found: " + (path ?? "/"));
-            }
-
-            var size = new FolderSize(ToVirtualPath(fullPath), bytes, files, folders);
-            if (epoch == Interlocked.Read(ref _sizeEpoch))
-            {
-                if (SizeCache.Count >= SizeCacheLimit)
-                {
-                    SizeCache.Clear();
-                }
-                SizeCache[fullPath] = (size, now + SizeCacheMilliseconds);
-            }
-            return size;
-        }
-
-        private static void ForgetSizes()
-        {
-            Interlocked.Increment(ref _sizeEpoch);
-            SizeCache.Clear();
-        }
-
         // ---- upload ------------------------------------------------------------------------------------------
 
         public async Task<UploadResult> SaveUploadAsync(
@@ -186,10 +116,6 @@ namespace TestProject.Services
             {
                 File.Delete(target);   // a cancelled or failed upload must not leave a half-written file behind
                 throw;
-            }
-            finally
-            {
-                ForgetSizes();
             }
             return new UploadResult(Path.GetFileName(target), ToVirtualPath(target), new FileInfo(target).Length);
         }
@@ -450,29 +376,22 @@ namespace TestProject.Services
             int succeeded = 0, skipped = 0;
             var failed = new List<ItemFailure>();
 
-            try
+            foreach (var target in targets)
             {
-                foreach (var target in targets)
+                try
                 {
-                    try
-                    {
-                        if (action(target)) succeeded++; else skipped++;
-                    }
-                    catch (FileServiceException ex)
-                    {
-                        failed.Add(new ItemFailure(ToVirtualPath(target), ex.Message));
-                    }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                    {
-                        // The framework's message contains the server's real path, so report a fixed one.
-                        failed.Add(new ItemFailure(ToVirtualPath(target),
-                            ex is UnauthorizedAccessException ? "Access denied" : "The item is in use or could not be changed"));
-                    }
+                    if (action(target)) succeeded++; else skipped++;
                 }
-            }
-            finally
-            {
-                ForgetSizes();   // delete, move and copy all change folder sizes
+                catch (FileServiceException ex)
+                {
+                    failed.Add(new ItemFailure(ToVirtualPath(target), ex.Message));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // The framework's message contains the server's real path, so report a fixed one.
+                    failed.Add(new ItemFailure(ToVirtualPath(target),
+                        ex is UnauthorizedAccessException ? "Access denied" : "The item is in use or could not be changed"));
+                }
             }
             return new OperationResult(succeeded, skipped, failed);
         }

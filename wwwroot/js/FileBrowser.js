@@ -1,7 +1,6 @@
 import { listFiles, startDownload, deleteItems, moveItems, copyItems, ApiError } from './api.js';
 import { toUrl, fromLocation } from './router.js';
 import { UploadQueue } from './UploadQueue.js';
-import { FolderSizes } from './FolderSizes.js';
 import { confirmDelete, pickFolder } from './dialogs.js';
 import { formatBytes, formatDate, count, parentPath, escapeHtml } from './format.js';
 
@@ -10,7 +9,6 @@ const OVERSCAN = 8;             // extra rows rendered above and below the viewp
 const SEARCH_DEBOUNCE_MS = 200;
 const UPLOAD_LIST_LIMIT = 6;    // rows shown in the upload panel; the rest are summarized
 const SUCCESS_LINGER_MS = 4000;
-const BACKGROUND_SIZE_LIMIT = 300;   // up to this many folders are measured in full; beyond it, only the ones on screen
 
 /**
  * The whole browser as one component. It renders into `root`, owns the UI state, and talks to the server
@@ -28,13 +26,9 @@ export class FileBrowser {
     #error = null;                // last failed response, or null
     #abort = null;                // cancels the request that is still in flight
     #selection = new Set();       // paths of selected entries
-    #listingKey = '';             // the view the current listing belongs to; differs from #viewKey while a new one loads
     #viewKey = '';                // folder + search text; the selection is cleared when it changes
     #busy = false;                // true while a delete, move or copy request is running
     #uploads;
-    #sizes;                       // folder sizes, loaded after the list
-    #folderPaths = [];            // every folder in the current listing
-    #sizeFrame = 0;
     #uploadFrame = 0;
     #searchTimer = 0;
     #scrollFrame = 0;
@@ -49,7 +43,6 @@ export class FileBrowser {
             onChange: () => this.#scheduleUploadRender(),
             onSettled: folders => this.#uploadsSettled(folders)
         });
-        this.#sizes = new FolderSizes({ onChange: () => this.#scheduleSizePaint() });
     }
 
     start() {
@@ -88,7 +81,6 @@ export class FileBrowser {
         const viewKey = this.#state.path + '\n' + this.#state.q;
         if (viewKey !== this.#viewKey) {
             this.#viewKey = viewKey;
-            this.#sizes.cancel();                // stop measuring folders of the view we are leaving
             if (this.#selection.size) {
                 this.#selection.clear();
                 this.#renderSelection();         // do not leave Download enabled for the old folder while the new one loads
@@ -98,16 +90,10 @@ export class FileBrowser {
         try {
             this.#listing = await listFiles(this.#state, request.signal);
             this.#error = null;
-            this.#listingKey = viewKey;
-            this.#folderPaths = this.#listing.query
-                ? []                             // search results mix folders and their contents, so no sizes there
-                : this.#listing.entries.filter(e => e.type === 'folder').map(e => e.path);
             this.#dropMissingFromSelection();
         } catch (err) {
             if (err.name === 'AbortError') return;
             this.#listing = null;
-            this.#folderPaths = [];
-            this.#listingKey = '';
             this.#error = err instanceof ApiError ? err : new ApiError(0, 'Could not reach the server');
             this.#selection.clear();
         }
@@ -296,7 +282,6 @@ export class FileBrowser {
             this.#notify(err.message, true);
         }
         this.#selection.clear();
-        this.#sizes.clear();                     // the change moved bytes between folders
         this.#busy = false;
         this.#root.removeAttribute('aria-busy');
         await this.#load({ keepScroll: true });
@@ -310,9 +295,7 @@ export class FileBrowser {
 
     /** The queue emptied. Refresh the list if any file landed in the folder being viewed. */
     #uploadsSettled(folders) {
-        this.#sizes.clear();                     // an upload grows every folder above it
         if (folders.has(this.#state.path)) this.#load({ keepScroll: true });
-        else this.#renderRows();                 // refetches the sizes that were just forgotten
         if (this.#uploads.stats.failed === 0) {
             this.#lingerTimer = setTimeout(() => this.#dismissUploads(), SUCCESS_LINGER_MS);
         }
@@ -431,45 +414,15 @@ export class FileBrowser {
         parts.push(count(totals.folders, 'folder', 'folders'));
         parts.push(count(totals.files, 'file', 'files'));
         parts.push(`${formatBytes(totals.bytes)} in files`);
-        const inFolders = this.#folderTotalText();
-        if (inFolders) parts.push(inFolders);
         if (truncated) parts.push('showing the first results only, so narrow the search');
         if (this.#selection.size) {
             let bytes = 0;
-            let pendingFolders = 0;
             for (const entry of entries) {
-                if (!this.#selection.has(entry.path)) continue;
-                if (entry.type === 'folder') {
-                    const size = this.#sizes.get(entry.path);
-                    if (size?.failed) continue;
-                    if (size) bytes += size.bytes; else pendingFolders++;
-                } else {
-                    bytes += entry.size ?? 0;
-                }
+                if (this.#selection.has(entry.path)) bytes += entry.size ?? 0;
             }
-            const size = pendingFolders ? `${formatBytes(bytes)} so far, folder sizes pending` : formatBytes(bytes);
-            parts.push(`<b class="selected-info">${this.#selection.size.toLocaleString()} selected (${size})</b>`);
+            parts.push(`<b class="selected-info">${this.#selection.size.toLocaleString()} selected (${formatBytes(bytes)} in files)</b>`);
         }
         summary.innerHTML = parts.map(p => `<span>${p}</span>`).join('');
-    }
-
-    /** The "in folders" part of the summary: the total once every folder is measured, progress until then. */
-    #folderTotalText() {
-        const paths = this.#folderPaths;
-        if (paths.length === 0) return '';
-        let bytes = 0, measured = 0, failed = 0;
-        for (const path of paths) {
-            const size = this.#sizes.get(path);
-            if (!size) continue;
-            measured++;
-            if (size.failed) failed++; else bytes += size.bytes;
-        }
-        if (measured === paths.length) {
-            return `${formatBytes(bytes)} in folders` + (failed ? ` (${failed} could not be measured)` : '');
-        }
-        return paths.length > BACKGROUND_SIZE_LIMIT
-            ? 'folder sizes load as you scroll'
-            : `calculating folder sizes (${measured} of ${paths.length})...`;
     }
 
     #renderToolbar() {
@@ -515,20 +468,11 @@ export class FileBrowser {
 
         const searching = Boolean(this.#listing?.query);
         let html = '';
-        const visibleFolders = [];
         for (let i = first; i < last; i++) {
             html += this.#rowHtml(entries[i], searching);
-            if (entries[i].type === 'folder') visibleFolders.push(entries[i].path);
         }
         rows.style.transform = `translateY(${first * ROW_HEIGHT}px)`;
         rows.innerHTML = html;
-
-        // Folders on screen are measured first. A short list is then measured in full so the summary can show a total.
-        if (searching || !this.#listing || this.#listingKey !== this.#viewKey) {
-            this.#sizes.cancel();
-        } else {
-            this.#sizes.load(visibleFolders, this.#folderPaths.length <= BACKGROUND_SIZE_LIMIT ? this.#folderPaths : []);
-        }
     }
 
     #rowHtml(entry, searching) {
@@ -543,42 +487,9 @@ export class FileBrowser {
                     <label class="check"><input type="checkbox" data-select data-path="${escapeHtml(entry.path)}"
                         aria-label="Select ${escapeHtml(entry.name)}"${selected ? ' checked' : ''}></label>
                     <div class="cell-name">${name}${where}</div>
-                    <div class="num">${isFolder ? (searching ? '' : this.#folderSizeHtml(entry.path)) : formatBytes(entry.size)}</div>
+                    <div class="num">${isFolder ? '' : formatBytes(entry.size)}</div>
                     <div class="when">${formatDate(entry.modified)}</div>
                 </div>`;
-    }
-
-    // ---- folder sizes -----------------------------------------------------------------------------------
-
-    /** What a folder's size cell shows right now. Used both to draw a row and to update it in place. */
-    #folderSizeCell(path) {
-        const size = this.#sizes.get(path);
-        if (!size) return { text: '…', cls: 'size-pending', title: 'Calculating...' };
-        if (size.failed) return { text: 'n/a', cls: 'size-failed', title: 'Could not measure this folder' };
-        return {
-            text: formatBytes(size.bytes), cls: '',
-            title: `${count(size.files, 'file', 'files')}, ${count(size.folders, 'folder', 'folders')} inside`
-        };
-    }
-
-    #folderSizeHtml(path) {
-        const cell = this.#folderSizeCell(path);
-        return `<span class="${cell.cls}" data-size-path="${escapeHtml(path)}" title="${escapeHtml(cell.title)}">${cell.text}</span>`;
-    }
-
-    /** Sizes arrive one at a time, so repaint at most once per frame, and only the cells and the summary. */
-    #scheduleSizePaint() {
-        if (this.#sizeFrame) return;
-        this.#sizeFrame = requestAnimationFrame(() => {
-            this.#sizeFrame = 0;
-            for (const cell of this.#el.rows.querySelectorAll('[data-size-path]')) {
-                const { text, cls, title } = this.#folderSizeCell(cell.dataset.sizePath);
-                cell.textContent = text;
-                cell.className = cls;
-                cell.title = title;
-            }
-            this.#renderSummary();
-        });
     }
 
     // ---- upload panel -----------------------------------------------------------------------------------
