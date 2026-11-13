@@ -27,6 +27,15 @@ namespace TestProject.Controllers {
         }
 
         /// <summary>
+        /// GET /api/files/size?path=/Documents returns the size of everything beneath that folder.
+        /// Listing does not include it, so a big tree never delays the list; the page asks folder by folder.
+        /// </summary>
+        [HttpGet("size")]
+        public FolderSize Size([FromQuery] string? path, CancellationToken cancellationToken) {
+            return _files.GetFolderSize(path, cancellationToken);
+        }
+
+        /// <summary>
         /// POST /api/files/upload?path=/Documents with one multipart "file" field.
         /// The client sends one request per file, which gives it per-file progress and per-file errors.
         /// </summary>
