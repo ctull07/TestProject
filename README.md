@@ -130,7 +130,6 @@ slow response can never overwrite a newer view.
 
 - No authentication or authorization. Anyone who can reach the server can read and change the home directory.
 - Search results are capped at 10,000 and flagged as truncated. Very large result sets would need paging.
-- Folder sizes are not shown (see above). A cached or on-demand size would fit here.
 - Uploading folders is not supported. Dropped folders are skipped with a message.
 - A very large copy or delete runs inside one request. A background job with progress would suit it better.
 - Move uses the file system's rename, so it is atomic on one volume. Across volumes a folder move can fail.

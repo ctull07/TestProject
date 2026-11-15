@@ -535,8 +535,8 @@ export class FileBrowser {
         const isFolder = entry.type === 'folder';
         const selected = this.#selection.has(entry.path);
         const name = isFolder
-            ? `<a data-nav class="name folder" href="${this.#linkTo({ path: entry.path })}">${escapeHtml(entry.name)}</a>`
-            : `<span class="name">${escapeHtml(entry.name)}</span>`;
+            ? `<a data-nav data-testid="entry-name" class="name folder" href="${this.#linkTo({ path: entry.path })}">${escapeHtml(entry.name)}</a>`
+            : `<span data-testid="entry-name" class="name">${escapeHtml(entry.name)}</span>`;
         // In search results the same name can appear in many folders, so show where each one lives.
         const where = searching ? `<span class="where">${escapeHtml(parentPath(entry.path))}</span>` : '';
         return `<div class="row${selected ? ' selected' : ''}">

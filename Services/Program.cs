@@ -3,6 +3,7 @@ using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.Features;
 using TestProject.Models;
 using TestProject.Services;
+using Microsoft.Extensions.Options;
 
 namespace TestProject
 {
@@ -35,8 +36,26 @@ namespace TestProject
 
             app.UseHttpsRedirection();
 
+
             app.UseDefaultFiles();   // serves wwwroot/index.html at "/"
             app.UseStaticFiles();
+
+            // A too-large upload would otherwise fail inside form binding and come back as a vague 400.
+            // Browsers and API clients send Content-Length up front, so refuse it here with a clear 413.
+            var uploadLimit = app.Services.GetRequiredService<IOptions<FileBrowserOptions>>().Value.MaxUploadBytes;
+            app.Use(async (context, next) =>
+            {
+                if (HttpMethods.IsPost(context.Request.Method)
+                    && context.Request.Path.Equals("/api/files/upload", StringComparison.OrdinalIgnoreCase)
+                    && context.Request.ContentLength > uploadLimit)
+                {
+                    await Results.Problem(
+                        title: "The file is larger than the server allows",
+                        statusCode: StatusCodes.Status413PayloadTooLarge).ExecuteAsync(context);
+                    return;
+                }
+                await next();
+            });
 
             app.MapControllers();
 
