@@ -15,7 +15,7 @@ jobs:
         with:
           repository: ctull07/TestProject
           path: app
-          token: ${{ secrets.APP_REPO_TOKEN }}   # uncomment if the app repo is private
+          token: ${{ secrets.APP_REPO_TOKEN }}   # used only for private repos
 
       - uses: actions/setup-dotnet@v4
         with:
