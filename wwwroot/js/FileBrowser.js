@@ -342,11 +342,11 @@ export class FileBrowser {
                     <input class="search" type="search" autocomplete="off" aria-label="Search files and folders"
                            placeholder="Search this folder and everything below">
                     <div class="actions">
-                        <button type="button" class="btn" data-action="upload">Upload</button>
-                        <button type="button" class="btn" data-action="download" disabled>Download</button>
-                        <button type="button" class="btn" data-action="copy" disabled>Copy to...</button>
-                        <button type="button" class="btn" data-action="move" disabled>Move to...</button>
-                        <button type="button" class="btn danger" data-action="delete" disabled>Delete</button>
+                        <button type="button" class="btn" data-action="upload" data-testid="upload-button">Upload</button>
+                        <button type="button" class="btn" data-action="download" data-testid="download-button" disabled>Download</button>
+                        <button type="button" class="btn" data-action="copy" data-testid="copy-button" disabled>Copy to...</button>
+                        <button type="button" class="btn" data-action="move" data-testid="move-button" disabled>Move to...</button>
+                        <button type="button" class="btn danger" data-action="delete" data-testid="delete-button" disabled>Delete</button>
                         <input type="file" class="file-input" multiple hidden>
                     </div>
                 </div>
