@@ -9,7 +9,7 @@ browser. The server returns JSON only.
 Requires the .NET 8 SDK.
 
 ```
-cd TestProject
+cd ../TestProject
 dotnet run
 ```
 
